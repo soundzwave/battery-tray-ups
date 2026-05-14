@@ -195,7 +195,9 @@ fi
 # ── Step 4: Verify INA219 presence ────────────────────────────────────────────
 info "Probing I2C bus 3 for INA219 at 0x43…"
 if command -v i2cdetect &>/dev/null && [ -e /dev/i2c-3 ]; then
-    if i2cdetect -y 3 2>/dev/null | grep -q "43"; then
+    # $5 in the "40:" row is address 0x43; driver-claimed devices show "UU" instead of "43"
+    _i2c_cell=$(i2cdetect -y 3 2>/dev/null | awk '/^40:/{print $5}')
+    if [[ "$_i2c_cell" == "43" || "$_i2c_cell" == "UU" ]]; then
         info "  INA219 detected at 0x43 ✓"
     else
         warn "  INA219 not found at 0x43. Check wiring and HAT seating."
