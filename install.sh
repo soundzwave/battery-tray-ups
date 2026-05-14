@@ -268,6 +268,12 @@ fi
 
 # ── Step 7: Systemd user service ──────────────────────────────────────────────
 info "Installing systemd user service…"
+
+if systemctl --user is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+    info "  Stopping running service before update…"
+    systemctl --user stop "$SERVICE_NAME.service"
+fi
+
 mkdir -p "$SYSTEMD_USER_DIR"
 
 # Patch the service file: replace placeholder Python with venv Python

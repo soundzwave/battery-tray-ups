@@ -96,7 +96,6 @@ _REG_CALIBRATION = 0x05
 #  Bits 10:7 : BADC — bus ADC resolution / averaging
 #  Bits 6:3  : SADC — shunt ADC resolution / averaging
 #  Bits 2:0  : MODE — operating mode
-_CFG_RST         = 0x8000
 _CFG_BRNG_32V    = 0x2000   # 32 V bus range (more than enough for LiPo)
 _CFG_PG_8        = 0x1800   # PGA /8 → ±320 mV shunt, covers ±3.2 A @ 0.1 Ω
 _CFG_BADC_128S   = 0x0780   # 128-sample average, 68.1 ms conversion
@@ -204,9 +203,6 @@ class INA219:
         self._close_locked()
         try:
             self._bus = smbus2.SMBus(self._bus_number)
-            # Reset device state before configuring
-            self._write_reg(_REG_CONFIG, _CFG_RST)
-            time.sleep(0.001)
             self._write_reg(_REG_CALIBRATION, self._cal_value)
             self._write_reg(_REG_CONFIG, _DEFAULT_CONFIG)
             logger.info(

@@ -1,5 +1,5 @@
 i2c:
-  bus: 1
+  bus: 3
   address: 0x43
   r_shunt_ohm: 0.1        # Shunt resistor value — verify against actual PCB marking
   max_current_a: 3.2      # Sets INA219 current register full-scale range
