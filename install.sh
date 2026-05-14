@@ -283,15 +283,32 @@ loginctl enable-linger "$USER" 2>/dev/null \
     || warn "loginctl enable-linger failed — service may not auto-start at boot"
 
 # ── Step 8: Desktop tray hint ─────────────────────────────────────────────────
-if command -v gnome-extensions &>/dev/null; then
-    if ! gnome-extensions list --enabled 2>/dev/null | grep -qi appindicator; then
-        warn "GNOME AppIndicator extension not enabled — tray icon may be hidden."
-        warn "Fix: sudo apt install gnome-shell-extension-appindicator"
-        warn "     gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com"
-    else
-        info "GNOME AppIndicator extension active ✓"
-    fi
-fi
+_de="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
+case "${_de,,}" in
+    *gnome*)
+        if command -v gnome-extensions &>/dev/null; then
+            if ! gnome-extensions list --enabled 2>/dev/null | grep -qi appindicator; then
+                warn "GNOME AppIndicator extension not enabled — tray icon may be hidden."
+                warn "Fix: sudo apt install gnome-shell-extension-appindicator"
+                warn "     gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com"
+            else
+                info "GNOME AppIndicator extension active ✓"
+            fi
+        fi
+        ;;
+    *xfce*)
+        if dpkg -s xfce4-statusnotifier-plugin &>/dev/null 2>&1; then
+            info "XFCE StatusNotifier plugin installed ✓"
+        else
+            warn "xfce4-statusnotifier-plugin not found — tray icon may not appear."
+            warn "Fix: sudo apt install xfce4-statusnotifier-plugin"
+            warn "     Then add 'Status Notifier Plugin' to your XFCE panel."
+        fi
+        ;;
+    *)
+        info "  Desktop: $_de — ensure your panel supports AppIndicator/StatusNotifier tray icons."
+        ;;
+esac
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
