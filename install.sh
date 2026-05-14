@@ -193,18 +193,28 @@ else
 fi
 
 # ── Step 4: Verify INA219 presence ────────────────────────────────────────────
-info "Probing I2C bus 3 for INA219 at 0x43…"
-if command -v i2cdetect &>/dev/null && [ -e /dev/i2c-3 ]; then
-    # $5 in the "40:" row is address 0x43; driver-claimed devices show "UU" instead of "43"
-    _i2c_cell=$(i2cdetect -y 3 2>/dev/null | awk '/^40:/{print $5}')
-    if [[ "$_i2c_cell" == "43" || "$_i2c_cell" == "UU" ]]; then
-        info "  INA219 detected at 0x43 ✓"
+info "Probing I2C buses for INA219 at 0x43…"
+if command -v i2cdetect &>/dev/null; then
+    _found_bus=""
+    for _bus_dev in /dev/i2c-*; do
+        [ -e "$_bus_dev" ] || continue
+        _bus_num="${_bus_dev##*-}"
+        # $5 in the "40:" row is 0x43; driver-claimed devices show "UU" instead of "43"
+        _i2c_cell=$(i2cdetect -y "$_bus_num" 2>/dev/null | awk '/^40:/{print $5}')
+        if [[ "$_i2c_cell" == "43" || "$_i2c_cell" == "UU" ]]; then
+            _found_bus="$_bus_num"
+            break
+        fi
+    done
+    if [ -n "$_found_bus" ]; then
+        info "  INA219 detected at 0x43 on i2c-${_found_bus} ✓"
     else
-        warn "  INA219 not found at 0x43. Check wiring and HAT seating."
-        warn "  Run manually: i2cdetect -y 3"
+        warn "  INA219 not found at 0x43 on any I2C bus. Check wiring and HAT seating."
+        warn "  Available buses: $(ls /dev/i2c-* 2>/dev/null | tr '\n' ' ')"
+        warn "  Run manually: i2cdetect -y <bus_number>"
     fi
 else
-    warn "  Cannot probe I2C (device not available yet — see step above)"
+    warn "  Cannot probe I2C (i2cdetect not installed — run: sudo apt-get install i2c-tools)"
 fi
 
 # ── Step 5: Qt and heavy deps ─────────────────────────────────────────────────
