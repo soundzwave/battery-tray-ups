@@ -1,0 +1,45 @@
+i2c:
+  bus: 3
+  address: 0x43
+  r_shunt_ohm: 0.1        # Shunt resistor value — verify against actual PCB marking
+  max_current_a: 3.2      # Sets INA219 current register full-scale range
+  retry_count: 3
+  retry_delay_s: 0.1
+
+battery:
+  nominal_capacity_mah: 2000   # Nameplate capacity of your battery
+  full_voltage_v: 4.2          # Single LiPo cell full charge voltage
+  empty_voltage_v: 3.0         # Cutoff voltage (hardware may cut off higher)
+  cells: 1                     # Number of series cells (1 = single LiPo/Li-ion)
+  invert_current: false        # Set true if charging shows negative current on your board
+
+polling:
+  interval_ms: 2000            # How often to poll INA219 (min ~500ms due to 128-sample averaging)
+
+history:
+  size: 1800                   # Samples to keep in memory (1800 × 2s = 1 hour)
+
+notifications:
+  low_battery_percent: 20
+  critical_battery_percent: 10
+  cooldown_seconds:
+    low_battery: 300
+    critical_battery: 120
+    power_disconnected: 60
+    power_restored: 30
+
+prometheus:
+  enabled: true
+  host: "127.0.0.1"
+  port: 9105
+
+logging:
+  level: "INFO"                # DEBUG | INFO | WARNING | ERROR
+  file: "logs/battery-monitor.log"
+  max_bytes: 10485760          # 10 MiB per log file
+  backup_count: 3
+
+ui:
+  window_width: 860
+  window_height: 640
+  chart_points: 300            # How many points to show on live charts
