@@ -22,6 +22,7 @@ Signal/slot wiring diagram
 import argparse
 import logging
 import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -45,7 +46,7 @@ from ui.window import MainWindow
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Battery monitor for Waveshare UPS HAT D (INA219 on I2C bus 3)"
+        description="Battery monitor for Waveshare UPS HAT D (INA219 auto-detected on I2C bus)"
     )
     p.add_argument("--config",    default="config/config.yaml", help="YAML config path")
     p.add_argument("--verbose",   action="store_true",           help="Enable DEBUG logging")
@@ -61,6 +62,17 @@ def _load_config(path: str) -> dict[str, Any]:
         sys.exit(1)
     with cfg_path.open(encoding="utf-8") as fh:
         return yaml.safe_load(fh)
+
+
+def _save_bus_to_config(config_path: str, bus_number: int) -> None:
+    path = Path(config_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+        text = re.sub(r"^(\s*bus:\s*)\d+", lambda m: f"{m.group(1)}{bus_number}", text, flags=re.MULTILINE)
+        path.write_text(text, encoding="utf-8")
+        logging.getLogger(__name__).info("Saved i2c.bus=%d to %s", bus_number, config_path)
+    except OSError as e:
+        logging.getLogger(__name__).warning("Could not save bus to config: %s", e)
 
 
 def main() -> None:
@@ -86,16 +98,37 @@ def main() -> None:
 
     # ── INA219 driver ─────────────────────────────────────────────────────────
     i2c_cfg = config["i2c"]
-    ina219  = INA219(
-        bus_number   = i2c_cfg["bus"],
-        address      = i2c_cfg["address"],
-        r_shunt_ohm  = i2c_cfg["r_shunt_ohm"],
-        max_current_a= i2c_cfg["max_current_a"],
-        retry_count  = i2c_cfg["retry_count"],
-        retry_delay_s= i2c_cfg["retry_delay_s"],
-    )
+
+    def _make_ina219(bus_number: int) -> INA219:
+        return INA219(
+            bus_number   = bus_number,
+            address      = i2c_cfg["address"],
+            r_shunt_ohm  = i2c_cfg["r_shunt_ohm"],
+            max_current_a= i2c_cfg["max_current_a"],
+            retry_count  = i2c_cfg["retry_count"],
+            retry_delay_s= i2c_cfg["retry_delay_s"],
+        )
+
+    ina219 = _make_ina219(i2c_cfg["bus"])
     if not ina219.connect():
-        logger.warning("Initial INA219 connect failed — will retry in poller")
+        logger.warning("INA219 not found on configured bus %d — scanning all I2C buses", i2c_cfg["bus"])
+        found = False
+        for dev in sorted(Path("/dev").glob("i2c-*")):
+            try:
+                bus_num = int(dev.name.split("-")[1])
+            except ValueError:
+                continue
+            if bus_num == i2c_cfg["bus"]:
+                continue
+            candidate = _make_ina219(bus_num)
+            if candidate.connect():
+                logger.info("INA219 found on bus %d — saving to config", bus_num)
+                ina219 = candidate
+                found = True
+                _save_bus_to_config(args.config, bus_num)
+                break
+        if not found:
+            logger.warning("INA219 not found on any I2C bus — will retry in poller")
 
     # ── Core subsystems ───────────────────────────────────────────────────────
     batt_cfg = config["battery"]
