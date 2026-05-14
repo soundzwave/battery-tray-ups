@@ -4,7 +4,7 @@ INA219 bidirectional current/voltage/power monitor driver.
 Hardware context
 ----------------
 Board  : Waveshare UPS HAT D
-I2C bus: 3  (Orange Pi Zero 3 GPIO)
+I2C bus: 1  (default; override via config/config.yaml → i2c.bus)
 Address: 0x43
 Shunt  : 0.1 Ω (verify on PCB)
 
@@ -145,7 +145,7 @@ class INA219:
 
     def __init__(
         self,
-        bus_number: int = 3,
+        bus_number: int = 1,
         address:    int = 0x43,
         r_shunt_ohm:   float = 0.1,
         max_current_a: float = 3.2,
