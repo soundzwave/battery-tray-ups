@@ -190,7 +190,7 @@ class INA219:
 if __name__ == '__main__':
     import subprocess
 
-    ina219 = INA219(i2c_bus=1, addr=0x43)
+    ina219 = INA219(i2c_bus=3, addr=0x43)
     low = 0
     while True:
         bus_voltage = ina219.getBusVoltage_V()
