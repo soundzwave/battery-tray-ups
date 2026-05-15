@@ -1,0 +1,15 @@
+[Unit]
+Description=Battery Tray UPS Monitor
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=INSTALL_DIR
+ExecStart=/usr/bin/python3 INSTALL_DIR/batteryTray.py
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=graphical-session.target
