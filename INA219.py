@@ -171,8 +171,7 @@ class INA219:
         return value * 0.01
 
     def getBusVoltage_V(self):
-        self.write(_REG_CALIBRATION,self._cal_value)
-        self.read(_REG_BUSVOLTAGE)
+        self.write(_REG_CALIBRATION, self._cal_value)
         return (self.read(_REG_BUSVOLTAGE) >> 3) * 0.004
 
     def getCurrent_mA(self):
@@ -188,44 +187,40 @@ class INA219:
             value -= 65535
         return value * self._power_lsb
         
-if __name__=='__main__':
-    import os
-    import sys
-        
-    # Create an INA219 instance.
-    ina219 = INA219(i2c_bus=1,addr=0x43)
+if __name__ == '__main__':
+    import subprocess
+
+    ina219 = INA219(i2c_bus=1, addr=0x43)
     low = 0
     while True:
-        bus_voltage = ina219.getBusVoltage_V()             # voltage on V- (load side)
-        shunt_voltage = ina219.getShuntVoltage_mV() / 1000 # voltage between V+ and V- across the shunt
-        current = -ina219.getCurrent_mA()                   # current in mA
-        power = ina219.getPower_W()                        # power in W
-        p = (bus_voltage - 3)/1.2*100
-        if(p > 100):p = 100
-        if(p < 0):p = 0
+        bus_voltage = ina219.getBusVoltage_V()
+        shunt_voltage = ina219.getShuntVoltage_mV() / 1000
+        current = -ina219.getCurrent_mA()
+        power = ina219.getPower_W()
+        p = (bus_voltage - 3.0) / 1.2 * 100
+        p = max(0.0, min(100.0, p))
 
-        # INA219 measure bus voltage on the load side. So PSU voltage = bus_voltage + shunt_voltage
-        #print("PSU Voltage:   {:6.3f} V".format(bus_voltage + shunt_voltage))
-        #print("Shunt Voltage: {:9.6f} V".format(shunt_voltage))
         print("Load Voltage:  {:6.3f} V".format(bus_voltage))
-        print("Current:       {:6.3f} A".format(current/1000))
+        print("Current:       {:6.3f} A".format(current / 1000))
         print("Power:         {:6.3f} W".format(power))
         print("Percent:       {:3.1f}%".format(p))
-        
-        if(bus_voltage < 3.15) and (current < 50):
+
+        if bus_voltage < 3.15 and current < 50:
             low += 1
-            if(low >= 30):
+            if low >= 30:
                 print("System shutdown now")
-                address = os.popen("i2cdetect -y -r 1 0x2d 0x2d | egrep '2d' | awk '{print $2}'").read()
-                if(address!='2d\n'):
+                result = subprocess.run(
+                    ["i2cdetect", "-y", "-r", "1", "0x2d", "0x2d"],
+                    capture_output=True, text=True
+                )
+                if "2d" not in result.stdout:
                     print("0x2d i2c address not detected, something wrong.")
                 else:
                     print("If charged, the system can be powered on again")
-                    #write 0x55 to 0x01 register of 0x2d Address device
-                    os.popen("i2cset -y 1 0x2d 0x01 0x55")
-                os.system("sudo poweroff")
+                    subprocess.run(["i2cset", "-y", "1", "0x2d", "0x01", "0x55"])
+                subprocess.run(["sudo", "poweroff"])
             else:
-                print("Voltage Low,please charge in time,otherwise it will shut down in {:2d} s".format(60-2*low))
+                print("Voltage Low, please charge in time, shutdown in {:2d} s".format(60 - 2 * low))
         else:
             low = 0
 
