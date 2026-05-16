@@ -291,10 +291,10 @@ class BatteryMonitor(QObject):
         if self._critical_dlg:
             self._critical_dlg.close()
         try:
-            result = subprocess.run(["i2cdetect", "-y", "-r", "1", "0x2d", "0x2d"],
+            result = subprocess.run(["i2cdetect", "-y", "-r", str(INA219_BUS), "0x2d", "0x2d"],
                                     capture_output=True, text=True, timeout=5)
             if "2d" in result.stdout:
-                subprocess.run(["i2cset", "-y", "1", "0x2d", "0x01", "0x55"], timeout=5)
+                subprocess.run(["i2cset", "-y", str(INA219_BUS), "0x2d", "0x01", "0x55"], timeout=5)
         except Exception as e:
             logging.error(f"i2c shutdown sequence failed: {e}")
         subprocess.run(["sudo", "poweroff"])
