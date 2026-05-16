@@ -10,6 +10,7 @@ ExecStart=INSTALL_DIR/.venv/bin/python3 INSTALL_DIR/batteryTray.py
 Restart=on-failure
 RestartSec=5
 Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 
