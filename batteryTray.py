@@ -102,7 +102,7 @@ class Worker(QObject):
     def _poll(self):
         try:
             v = self._ina.getBusVoltage_V()
-            c = -int(self._ina.getCurrent_mA())
+            c = int(self._ina.getCurrent_mA())
             w = self._ina.getPower_W()
             if self._in_error:
                 self._in_error = False
@@ -219,7 +219,7 @@ class BatteryMonitor(QObject):
         self._current = c
         self._power = w
         self._i2c_error_notified = False
-        self._charging = c > CHARGE_THRESHOLD_MA
+        self._charging = c < -CHARGE_THRESHOLD_MA
 
         if self._prev_charging is not None and self._prev_charging != self._charging:
             if self._charging:
