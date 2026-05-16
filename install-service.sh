@@ -25,6 +25,11 @@ esac
 echo "Installing ${SERVICE_NAME} service for user: ${USER}"
 echo "App directory: ${SCRIPT_DIR}"
 
+if ! python3 -c "import PyQt5" 2>/dev/null; then
+    echo "Installing python3-pyqt5 via apt..."
+    apt-get install -y python3-pyqt5
+fi
+
 echo "Setting up virtual environment..."
 python3 -m venv --system-site-packages "${SCRIPT_DIR}/.venv"
 "${SCRIPT_DIR}/.venv/bin/pip" install --quiet -r "${SCRIPT_DIR}/requirements.txt"
