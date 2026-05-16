@@ -84,11 +84,14 @@ class Worker(QObject):
     reading = pyqtSignal(float, float, float)  # voltage, current_mA, power_W
     error   = pyqtSignal(str)
 
+    _RECOVERY_AFTER = 3  # consecutive errors before bus reset attempt
+
     def __init__(self, ina):
         super().__init__()
         self._ina = ina
         self._timer = None
         self._in_error = False
+        self._error_streak = 0
 
     def run(self):
         self._timer = QTimer()
@@ -103,16 +106,44 @@ class Worker(QObject):
             w = self._ina.getPower_W()
             if self._in_error:
                 self._in_error = False
+                self._error_streak = 0
                 self._timer.setInterval(POLL_INTERVAL_MS)
             self.reading.emit(v, c, w)
         except Exception as e:
+            self._error_streak += 1
             self._in_error = True
             self._timer.setInterval(5000)
             self.error.emit(str(e))
+            if self._error_streak >= self._RECOVERY_AFTER:
+                self._error_streak = 0
+                self._recover_bus()
+
+    def _recover_bus(self):
+        logging.info("I2C bus locked — attempting driver reset...")
+        try:
+            dev_link = f"/sys/class/i2c-adapter/i2c-{INA219_BUS}/device"
+            dev_name = os.path.basename(os.readlink(dev_link))
+            unbind = "/sys/bus/platform/drivers/mv64xxx_i2c/unbind"
+            bind   = "/sys/bus/platform/drivers/mv64xxx_i2c/bind"
+            with open(unbind, "w") as f:
+                f.write(dev_name)
+            time.sleep(1)
+            with open(bind, "w") as f:
+                f.write(dev_name)
+            time.sleep(1)
+            self._ina.bus.close()
+            self._ina.bus = __import__("smbus2").SMBus(INA219_BUS)
+            logging.info("I2C bus recovery succeeded")
+        except Exception as e:
+            logging.error(f"I2C bus recovery failed: {e}")
 
     def stop(self):
         if self._timer:
             self._timer.stop()
+        try:
+            self._ina.bus.close()
+        except Exception:
+            pass
 
 
 class BatteryMonitor(QObject):
