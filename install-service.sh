@@ -25,6 +25,11 @@ esac
 echo "Installing ${SERVICE_NAME} service for user: ${USER}"
 echo "App directory: ${SCRIPT_DIR}"
 
+echo "Setting up virtual environment..."
+python3 -m venv --system-site-packages "${SCRIPT_DIR}/.venv"
+"${SCRIPT_DIR}/.venv/bin/pip" install --quiet -r "${SCRIPT_DIR}/requirements.txt"
+echo "Virtual environment ready."
+
 mkdir -p "${SERVICE_DIR}"
 
 sed "s|INSTALL_DIR|${SCRIPT_DIR}|g" "${SCRIPT_DIR}/battery-tray.service" > "${SERVICE_FILE}"

@@ -1,4 +1,4 @@
-import smbus
+import smbus2 as smbus
 import time
 
 # Config Register (R/W)
@@ -189,8 +189,16 @@ class INA219:
         
 if __name__ == '__main__':
     import subprocess
+    import configparser
+    import os
 
-    ina219 = INA219(i2c_bus=3, addr=0x43)
+    _cfg = configparser.ConfigParser()
+    _cfg.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini"))
+    _bus  = int(_cfg.get("sensor", "i2c_bus",    fallback="1"))
+    _addr = int(_cfg.get("sensor", "ina219_addr", fallback="0x43"), 0)
+
+    ina219 = INA219(i2c_bus=_bus, addr=_addr)
+
     low = 0
     while True:
         bus_voltage = ina219.getBusVoltage_V()
