@@ -142,12 +142,19 @@ class BatteryMonitor(QObject):
         self._shutdown_timer.setInterval(1000)
         self._shutdown_timer.timeout.connect(self._tick)
 
-        try:
-            ina = INA219.INA219(i2c_bus=INA219_BUS, addr=INA219_ADDR)
-        except Exception as e:
-            logging.error(f"Failed to initialise INA219: {e}")
+        ina = None
+        for attempt in range(10):
+            try:
+                ina = INA219.INA219(i2c_bus=INA219_BUS, addr=INA219_ADDR)
+                break
+            except Exception as e:
+                logging.warning(f"INA219 init attempt {attempt + 1}/10 failed: {e}")
+                time.sleep(2)
+
+        if ina is None:
+            logging.error("Failed to initialise INA219 after 10 attempts")
             self._tray.showMessage("Sensor Error",
-                                   f"Cannot initialise battery sensor:\n{e}",
+                                   "Cannot initialise battery sensor",
                                    QSystemTrayIcon.Critical, 8000)
             self._tray.setToolTip("Sensor init failed")
             return

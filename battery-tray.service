@@ -1,6 +1,6 @@
 [Unit]
 Description=Battery Tray UPS Monitor
-After=graphical.target
+After=graphical.target network.target
 Wants=graphical.target
 
 [Service]
