@@ -3,14 +3,13 @@ set -e
 
 SCRIPT_DIR=$(readlink -f "$(dirname "$0")")
 SERVICE_NAME="battery-tray"
-SERVICE_DIR="${HOME}/.config/systemd/user"
-SERVICE_FILE="${SERVICE_DIR}/${SERVICE_NAME}.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 case "${1}" in
     uninstall)
-        systemctl --user disable --now "${SERVICE_NAME}" 2>/dev/null || true
+        systemctl disable --now "${SERVICE_NAME}" 2>/dev/null || true
         rm -f "${SERVICE_FILE}"
-        systemctl --user daemon-reload
+        systemctl daemon-reload
         echo "Service removed."
         exit 0
         ;;
@@ -22,15 +21,12 @@ case "${1}" in
         ;;
 esac
 
-XPROFILE="${HOME}/.xprofile"
-IMPORT_LINE="systemctl --user import-environment DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS"
-if ! grep -qF "${IMPORT_LINE}" "${XPROFILE}" 2>/dev/null; then
-    echo "${IMPORT_LINE}" >> "${XPROFILE}"
-    echo "Added environment import to ${XPROFILE}"
+# Remove legacy user service if present
+if systemctl --user is-active --quiet battery-tray 2>/dev/null; then
+    systemctl --user disable --now battery-tray 2>/dev/null || true
 fi
-
-echo "Installing ${SERVICE_NAME} service for user: ${USER}"
-echo "App directory: ${SCRIPT_DIR}"
+rm -f "${HOME}/.config/systemd/user/battery-tray.service"
+systemctl --user daemon-reload 2>/dev/null || true
 
 if ! python3 -c "import PyQt5" 2>/dev/null; then
     echo "Installing python3-pyqt5 via apt..."
@@ -42,14 +38,15 @@ python3 -m venv --system-site-packages "${SCRIPT_DIR}/.venv"
 "${SCRIPT_DIR}/.venv/bin/pip" install --quiet -r "${SCRIPT_DIR}/requirements.txt"
 echo "Virtual environment ready."
 
-mkdir -p "${SERVICE_DIR}"
+echo "Installing ${SERVICE_NAME} as system service"
+echo "App directory: ${SCRIPT_DIR}"
 
 sed "s|INSTALL_DIR|${SCRIPT_DIR}|g" "${SCRIPT_DIR}/battery-tray.service" > "${SERVICE_FILE}"
 
-systemctl --user daemon-reload
-systemctl --user enable --now "${SERVICE_NAME}"
+systemctl daemon-reload
+systemctl enable --now "${SERVICE_NAME}"
 
 echo ""
 echo "Done. Check status with:"
-echo "  systemctl --user status ${SERVICE_NAME}"
-echo "  journalctl --user -u ${SERVICE_NAME} -f"
+echo "  systemctl status ${SERVICE_NAME}"
+echo "  journalctl -u ${SERVICE_NAME} -f"
