@@ -22,6 +22,13 @@ case "${1}" in
         ;;
 esac
 
+XPROFILE="${HOME}/.xprofile"
+IMPORT_LINE="systemctl --user import-environment DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS"
+if ! grep -qF "${IMPORT_LINE}" "${XPROFILE}" 2>/dev/null; then
+    echo "${IMPORT_LINE}" >> "${XPROFILE}"
+    echo "Added environment import to ${XPROFILE}"
+fi
+
 echo "Installing ${SERVICE_NAME} service for user: ${USER}"
 echo "App directory: ${SCRIPT_DIR}"
 
