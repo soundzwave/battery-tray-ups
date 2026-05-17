@@ -166,7 +166,7 @@ class INA219:
     def getShuntVoltage_mV(self):
         value = self.read(_REG_SHUNTVOLTAGE)
         if value > 32767:
-            value -= 65535
+            value -= 65536
         return value * 0.01
 
     def getBusVoltage_V(self):
@@ -175,14 +175,11 @@ class INA219:
     def getCurrent_mA(self):
         value = self.read(_REG_CURRENT)
         if value > 32767:
-            value -= 65535
+            value -= 65536
         return value * self._current_lsb
 
     def getPower_W(self):
-        value = self.read(_REG_POWER)
-        if value > 32767:
-            value -= 65535
-        return value * self._power_lsb
+        return self.read(_REG_POWER) * self._power_lsb
         
 if __name__ == '__main__':
     import subprocess
@@ -191,8 +188,10 @@ if __name__ == '__main__':
 
     _cfg = configparser.ConfigParser()
     _cfg.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini"))
-    _bus  = int(_cfg.get("sensor", "i2c_bus",    fallback="1"))
-    _addr = int(_cfg.get("sensor", "ina219_addr", fallback="0x43"), 0)
+    _bus     = int(_cfg.get("sensor",  "i2c_bus",      fallback="1"))
+    _addr    = int(_cfg.get("sensor",  "ina219_addr",   fallback="0x43"), 0)
+    _v_min   = float(_cfg.get("battery", "min_voltage_v", fallback="3.0"))
+    _v_max   = float(_cfg.get("battery", "max_voltage_v", fallback="4.2"))
 
     ina219 = INA219(i2c_bus=_bus, addr=_addr)
 
@@ -202,7 +201,7 @@ if __name__ == '__main__':
         shunt_voltage = ina219.getShuntVoltage_mV() / 1000
         current = -ina219.getCurrent_mA()
         power = ina219.getPower_W()
-        p = (bus_voltage - 3.0) / 1.2 * 100
+        p = (bus_voltage - _v_min) / (_v_max - _v_min) * 100
         p = max(0.0, min(100.0, p))
 
         print("Load Voltage:  {:6.3f} V".format(bus_voltage))

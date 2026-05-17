@@ -42,6 +42,7 @@ INA219_ADDR            = int(_get("sensor",  "ina219_addr",               "0x43"
 INA219_BUS             = int(_get("sensor",  "i2c_bus",                        1))
 CHARGE_THRESHOLD_MA    = int(_get("sensor",  "charge_current_threshold_ma",   50))
 POLL_INTERVAL_MS       = int(_get("sensor",  "poll_interval_ms",            1000))
+_CURRENT_HISTORY_LEN   = max(5, 300_000 // POLL_INTERVAL_MS)  # ~5 min window
 LOG_FILE               = _get("logging", "log_file",                           "")
 LOG_MAX_BYTES          = int(_get("logging", "max_bytes",                 1048576))
 LOG_BACKUP_COUNT       = int(_get("logging", "backup_count",                    3))
@@ -172,7 +173,7 @@ class BatteryMonitor(QObject):
         self._current = 0.0
         self._power = 0.0
         self._buf = deque(maxlen=5)
-        self._current_history = deque(maxlen=30)
+        self._current_history = deque(maxlen=_CURRENT_HISTORY_LEN)
         self._low30_notified = False
         self._low20_notified = False
         self._low10_notified = False
@@ -309,6 +310,9 @@ class BatteryMonitor(QObject):
             self._low10_notified = True
             self._low20_notified = True
             self._low30_notified = True
+            if self._warn20_dlg:
+                self._warn20_dlg.close()
+                self._warn20_dlg = None
             self._countdown = SHUTDOWN_COUNTDOWN_SEC
             self._shutdown_timer.start()
             dlg = QMessageBox(QMessageBox.NoIcon, "Battery Critical",
