@@ -4,14 +4,21 @@ After=graphical.target network.target
 Wants=graphical.target
 
 [Service]
-Type=simple
+Type=notify
 User=root
 WorkingDirectory=INSTALL_DIR
+ExecStartPre=/bin/bash -c '\
+  pid=$(pgrep -o Xorg 2>/dev/null || pgrep -o -f "/usr/bin/X " 2>/dev/null); \
+  if [ -n "$pid" ]; then \
+    grep -z "^XAUTHORITY=" /proc/$pid/environ 2>/dev/null | tr -d "\0" > /tmp/btt-env; \
+  fi; \
+  [ -s /tmp/btt-env ] || echo "XAUTHORITY=/root/.Xauthority" > /tmp/btt-env'
+EnvironmentFile=/tmp/btt-env
 ExecStart=INSTALL_DIR/.venv/bin/python3 INSTALL_DIR/batteryTray.py
 Restart=on-failure
 RestartSec=5
+WatchdogSec=30
 Environment=DISPLAY=:0
-Environment=XAUTHORITY=/var/run/lightdm/root/:0
 
 [Install]
 WantedBy=graphical.target

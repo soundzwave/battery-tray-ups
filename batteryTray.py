@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import socket
 import logging
 import logging.handlers
 import signal
@@ -46,6 +47,7 @@ _CURRENT_HISTORY_LEN   = max(5, 300_000 // POLL_INTERVAL_MS)  # ~5 min window
 LOG_FILE               = _get("logging", "log_file",                           "")
 LOG_MAX_BYTES          = int(_get("logging", "max_bytes",                 1048576))
 LOG_BACKUP_COUNT       = int(_get("logging", "backup_count",                    3))
+DISCHARGE_CURVE        = _get("battery", "discharge_curve",               "lipo")
 
 _handlers = [logging.StreamHandler()]
 if LOG_FILE:
@@ -56,12 +58,45 @@ if LOG_FILE:
 logging.basicConfig(format="%(message)s", level=logging.INFO, handlers=_handlers)
 
 
+_LIPO_SOC = [
+    (4.20, 100), (4.15, 95), (4.11, 90), (4.08, 85),
+    (4.02,  80), (3.98, 75), (3.95, 70), (3.91, 65),
+    (3.87,  60), (3.83, 55), (3.79, 50), (3.75, 45),
+    (3.71,  40), (3.67, 35), (3.61, 30), (3.55, 25),
+    (3.49,  20), (3.42, 15), (3.35, 10), (3.20,  5),
+    (3.00,   0),
+]
+
 def voltage_to_percent(v):
+    if DISCHARGE_CURVE == "lipo":
+        if v >= _LIPO_SOC[0][0]:
+            return 100
+        if v <= _LIPO_SOC[-1][0]:
+            return 0
+        for i in range(len(_LIPO_SOC) - 1):
+            v_hi, p_hi = _LIPO_SOC[i]
+            v_lo, p_lo = _LIPO_SOC[i + 1]
+            if v_lo <= v <= v_hi:
+                t = (v - v_lo) / (v_hi - v_lo)
+                return int(p_lo + t * (p_hi - p_lo))
+        return 0
     if v >= MAX_VOLTAGE_V:
         return 100
     if v <= MIN_VOLTAGE_V:
         return 0
     return int((v - MIN_VOLTAGE_V) / (MAX_VOLTAGE_V - MIN_VOLTAGE_V) * 100)
+
+
+def _sd_notify(state: str) -> None:
+    addr = os.environ.get("NOTIFY_SOCKET", "")
+    if not addr:
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr if not addr.startswith("@") else "\0" + addr[1:])
+            s.sendall(state.encode())
+    except OSError:
+        pass
 
 
 def _img(name):
@@ -174,6 +209,7 @@ class BatteryMonitor(QObject):
         self._power = 0.0
         self._buf = deque(maxlen=5)
         self._current_history = deque(maxlen=_CURRENT_HISTORY_LEN)
+        self._charge_history  = deque(maxlen=_CURRENT_HISTORY_LEN)
         self._low30_notified = False
         self._low20_notified = False
         self._low10_notified = False
@@ -214,6 +250,12 @@ class BatteryMonitor(QObject):
         QApplication.instance().aboutToQuit.connect(self._stop_worker)
         self._thread.start()
 
+        self._watchdog_timer = QTimer()
+        self._watchdog_timer.setInterval(15_000)
+        self._watchdog_timer.timeout.connect(lambda: _sd_notify("WATCHDOG=1"))
+        self._watchdog_timer.start()
+        _sd_notify("READY=1")
+
     def _build_menu(self):
         status_act = QAction("Status", self)
         about_act  = QAction("About",  self)
@@ -252,11 +294,14 @@ class BatteryMonitor(QObject):
                 if self._shutdown_timer.isActive():
                     self._cancel_shutdown(user_dismissed=False)
             else:
+                self._charge_history.clear()
                 self._tray.showMessage("Power Disconnected", "Running on battery.",
                                        QSystemTrayIcon.Warning, 4000)
         self._prev_charging = self._charging
 
-        if not self._charging:
+        if self._charging:
+            self._charge_history.append(abs(mc))
+        else:
             self._current_history.append(abs(mc))
 
         self._percent = voltage_to_percent(mv)
@@ -285,6 +330,12 @@ class BatteryMonitor(QObject):
 
     def _time_str(self):
         if self._charging:
+            if not self._charge_history:
+                return "charging"
+            avg_mA = statistics.mean(self._charge_history)
+            if avg_mA > 10:
+                to_full = (1.0 - self._percent / 100.0) * BATTERY_CAPACITY_MAH
+                return f"full in {format_time(int(to_full / avg_mA * 60))}"
             return "charging"
         if not self._current_history:
             return ""
