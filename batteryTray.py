@@ -33,6 +33,7 @@ BATTERY_CAPACITY_MAH   = int(_get("battery", "capacity_mah",               4000)
 WARN_30_PCT            = int(_get("battery", "warn_30_pct",                   30))
 WARN_20_PCT            = int(_get("battery", "warn_20_pct",                   20))
 WARN_10_PCT            = int(_get("battery", "warn_10_pct",                   10))
+WARN_5_PCT             = int(_get("battery", "warn_5_pct",                     5))
 SHUTDOWN_COUNTDOWN_SEC = int(_get("battery", "shutdown_countdown_sec",        60))
 INA219_ADDR            = int(_get("sensor",  "ina219_addr",               "0x43"), 0)
 INA219_BUS             = int(_get("sensor",  "i2c_bus",                        1))
@@ -161,9 +162,11 @@ class BatteryMonitor(QObject):
         self._low30_notified = False
         self._low20_notified = False
         self._low10_notified = False
+        self._low5_notified = False
         self._i2c_error_notified = False
         self._countdown = 0
         self._status_dlg = None
+        self._warn20_dlg = None
         self._critical_dlg = None
         self._about_dlg = None
 
@@ -218,6 +221,11 @@ class BatteryMonitor(QObject):
         return menu
 
     def _on_reading(self, v, c, w):
+        if not (2.5 <= v <= 4.35):  # discard transient garbage after I2C bus reset
+            logging.warning(f"Ignoring out-of-range voltage: {v:.2f}V")
+            return
+        if self._i2c_error_notified:
+            self._buf.clear()
         self._buf.append((v, c, w))
         v = statistics.median(r[0] for r in self._buf)
         c = statistics.median(r[1] for r in self._buf)
@@ -257,6 +265,8 @@ class BatteryMonitor(QObject):
             self._low20_notified = False
         if self._charging or self._percent > WARN_10_PCT:
             self._low10_notified = False
+        if self._charging or self._percent > WARN_5_PCT:
+            self._low5_notified = False
 
         if not self._charging:
             self._check_warnings()
@@ -288,19 +298,29 @@ class BatteryMonitor(QObject):
                                    QSystemTrayIcon.Warning, 5000)
         if WARN_10_PCT < p <= WARN_20_PCT and not self._low20_notified:
             self._low20_notified = True
-            self._tray.showMessage("Battery Warning",
-                                   "Battery at 20%. Please connect the power adapter.",
-                                   QSystemTrayIcon.Warning, 5000)
-        if p <= WARN_10_PCT and not self._low10_notified:
+            dlg = QMessageBox(QMessageBox.Warning, "Battery Warning",
+                              "<p><strong>Заряд батареи 20%!<br>"
+                              "Подключите адаптер питания.</strong>")
+            dlg.setIconPixmap(QPixmap(_img("batteryQ.png")))
+            dlg.addButton("OK", QMessageBox.AcceptRole)
+            dlg.finished.connect(lambda: setattr(self, "_warn20_dlg", None))
+            self._warn20_dlg = dlg
+            dlg.show()
+        if WARN_5_PCT < p <= WARN_10_PCT and not self._low10_notified:
             self._low10_notified = True
+            self._tray.showMessage("Battery Critical",
+                                   "Battery at 10%. Connect power adapter immediately!",
+                                   QSystemTrayIcon.Critical, 8000)
+        if p <= WARN_5_PCT and not self._low5_notified:
+            self._low5_notified = True
             self._countdown = SHUTDOWN_COUNTDOWN_SEC
             self._shutdown_timer.start()
             dlg = QMessageBox(QMessageBox.NoIcon, "Battery Critical",
-                              "<p><strong>Battery level critical!<br>"
-                              "Please connect the power adapter.</strong>")
+                              "<p><strong>Заряд батареи 5% — критический уровень!<br>"
+                              "Подключите адаптер питания.</strong>")
             dlg.setIconPixmap(QPixmap(_img("batteryQ.png")))
-            dlg.setInformativeText(f"auto shutdown after {self._countdown} seconds")
-            dlg.addButton("Dismiss", QMessageBox.RejectRole).clicked.connect(
+            dlg.setInformativeText(f"автовыключение через {self._countdown} секунд")
+            dlg.addButton("Отмена", QMessageBox.RejectRole).clicked.connect(
                 lambda: self._cancel_shutdown(user_dismissed=True)
             )
             self._critical_dlg = dlg
@@ -313,7 +333,7 @@ class BatteryMonitor(QObject):
             self._do_shutdown()
         elif self._critical_dlg:
             self._critical_dlg.setInformativeText(
-                f"auto shutdown after {self._countdown} seconds"
+                f"автовыключение через {self._countdown} секунд"
             )
 
     def _cancel_shutdown(self, user_dismissed=True):
