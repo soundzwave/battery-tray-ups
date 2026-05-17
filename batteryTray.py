@@ -9,6 +9,8 @@ import logging.handlers
 import signal
 import subprocess
 import configparser
+import statistics
+from collections import deque
 import INA219
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
@@ -155,6 +157,7 @@ class BatteryMonitor(QObject):
         self._voltage = 0.0
         self._current = 0.0
         self._power = 0.0
+        self._buf = deque(maxlen=5)
         self._low30_notified = False
         self._low20_notified = False
         self._low10_notified = False
@@ -215,6 +218,10 @@ class BatteryMonitor(QObject):
         return menu
 
     def _on_reading(self, v, c, w):
+        self._buf.append((v, c, w))
+        v = statistics.median(r[0] for r in self._buf)
+        c = statistics.median(r[1] for r in self._buf)
+        w = statistics.median(r[2] for r in self._buf)
         self._voltage = v
         self._current = c
         self._power = w
@@ -237,7 +244,7 @@ class BatteryMonitor(QObject):
         self._tray.setIcon(QIcon(_img(f"battery.{icon_idx}.png")))
 
         time_str = self._time_str()
-        tooltip = "%d%%  %.2fV  %dmA  %.1fW  %s" % (self._percent, v, c, w, time_str)
+        tooltip = "%d%%  %.2fV  %dmA  %.1fW  %s" % (self._percent, v, abs(c), w, time_str)
         self._tray.setToolTip(tooltip.strip())
         logging.info(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {tooltip.strip()}")
 
@@ -270,7 +277,7 @@ class BatteryMonitor(QObject):
             "Current:    %4dmA\n"
             "Power:      %.1fW\n"
             "Remaining:  %s"
-        ) % (self._percent, self._voltage, self._current, self._power, self._time_str())
+        ) % (self._percent, self._voltage, abs(self._current), self._power, self._time_str())
 
     def _check_warnings(self):
         p = self._percent
