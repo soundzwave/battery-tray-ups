@@ -58,7 +58,7 @@ class Mode:
 
 class INA219:
     def __init__(self, i2c_bus=1, addr=0x40):
-        self.bus = smbus.SMBus(i2c_bus);
+        self.bus = smbus.SMBus(i2c_bus)
         self.addr = addr
 
         # Set chip to known config values to start
@@ -215,14 +215,14 @@ if __name__ == '__main__':
             if low >= 30:
                 print("System shutdown now")
                 result = subprocess.run(
-                    ["i2cdetect", "-y", "-r", "1", "0x2d", "0x2d"],
+                    ["i2cdetect", "-y", "-r", str(_bus), "0x2d", "0x2d"],
                     capture_output=True, text=True
                 )
                 if "2d" not in result.stdout:
                     print("0x2d i2c address not detected, something wrong.")
                 else:
                     print("If charged, the system can be powered on again")
-                    subprocess.run(["i2cset", "-y", "1", "0x2d", "0x01", "0x55"])
+                    subprocess.run(["i2cset", "-y", str(_bus), "0x2d", "0x01", "0x55"])
                 subprocess.run(["sudo", "poweroff"])
             else:
                 print("Voltage Low, please charge in time, shutdown in {:2d} s".format(60 - 2 * low))

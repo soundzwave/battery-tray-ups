@@ -10,6 +10,7 @@ import signal
 import subprocess
 import configparser
 import statistics
+import smbus2
 from collections import deque
 import INA219
 from PyQt5.QtGui import QIcon, QPixmap
@@ -30,6 +31,8 @@ def _get(section, key, fallback):
     return _cfg.get(section, key, fallback=str(fallback))
 
 BATTERY_CAPACITY_MAH   = int(_get("battery", "capacity_mah",               4000))
+MIN_VOLTAGE_V          = float(_get("battery", "min_voltage_v",             3.00))
+MAX_VOLTAGE_V          = float(_get("battery", "max_voltage_v",             4.20))
 WARN_30_PCT            = int(_get("battery", "warn_30_pct",                   30))
 WARN_20_PCT            = int(_get("battery", "warn_20_pct",                   20))
 WARN_10_PCT            = int(_get("battery", "warn_10_pct",                   10))
@@ -51,43 +54,29 @@ if LOG_FILE:
     ))
 logging.basicConfig(format="%(message)s", level=logging.INFO, handlers=_handlers)
 
-# LiPo discharge curve: (voltage V, state-of-charge %)
-_SOC_CURVE = [
-    (4.20, 100), (4.15, 95), (4.11, 90), (4.08, 85),
-    (4.02,  80), (3.98, 75), (3.95, 70), (3.91, 65),
-    (3.87,  60), (3.83, 55), (3.79, 50), (3.75, 45),
-    (3.71,  40), (3.67, 35), (3.61, 30), (3.55, 25),
-    (3.49,  20), (3.42, 15), (3.35, 10), (3.20,  5),
-    (3.00,   0),
-]
 
 def voltage_to_percent(v):
-    if v >= _SOC_CURVE[0][0]:
+    if v >= MAX_VOLTAGE_V:
         return 100
-    if v <= _SOC_CURVE[-1][0]:
+    if v <= MIN_VOLTAGE_V:
         return 0
-    for i in range(len(_SOC_CURVE) - 1):
-        v_hi, p_hi = _SOC_CURVE[i]
-        v_lo, p_lo = _SOC_CURVE[i + 1]
-        if v_lo <= v <= v_hi:
-            t = (v - v_lo) / (v_hi - v_lo)
-            return int(p_lo + t * (p_hi - p_lo))
-    return 0
+    return int((v - MIN_VOLTAGE_V) / (MAX_VOLTAGE_V - MIN_VOLTAGE_V) * 100)
+
 
 def _img(name):
     return os.path.join(BASE_DIR, "images", name)
 
 def format_time(minutes):
     if minutes >= 60:
-        return "~%dh %02dm" % (minutes // 60, minutes % 60)
-    return "~%dm" % minutes
+        return f"~{minutes // 60}h {minutes % 60:02d}m"
+    return f"~{minutes}m"
 
 
 class Worker(QObject):
     reading = pyqtSignal(float, float, float)  # voltage, current_mA, power_W
     error   = pyqtSignal(str)
 
-    _RECOVERY_AFTER = 3  # consecutive errors before bus reset attempt
+    _RECOVERY_AFTER = 3
     _INIT_RETRY_MS  = 10_000
 
     def __init__(self, ina):
@@ -141,18 +130,28 @@ class Worker(QObject):
             dev_link = f"/sys/class/i2c-adapter/i2c-{INA219_BUS}/device"
             dev_name = os.path.basename(os.readlink(dev_link))
             unbind = "/sys/bus/platform/drivers/mv64xxx_i2c/unbind"
-            bind   = "/sys/bus/platform/drivers/mv64xxx_i2c/bind"
             with open(unbind, "w") as f:
                 f.write(dev_name)
-            time.sleep(1)
-            with open(bind, "w") as f:
-                f.write(dev_name)
-            time.sleep(1)
-            self._ina.bus.close()
-            self._ina.bus = __import__("smbus2").SMBus(INA219_BUS)
-            logging.info("I2C bus recovery succeeded")
+            QTimer.singleShot(1000, lambda: self._recover_bind(dev_name))
         except Exception as e:
             logging.error(f"I2C bus recovery failed: {e}")
+
+    def _recover_bind(self, dev_name):
+        try:
+            bind = "/sys/bus/platform/drivers/mv64xxx_i2c/bind"
+            with open(bind, "w") as f:
+                f.write(dev_name)
+            QTimer.singleShot(1000, self._recover_reconnect)
+        except Exception as e:
+            logging.error(f"I2C bus recovery (bind) failed: {e}")
+
+    def _recover_reconnect(self):
+        try:
+            self._ina.bus.close()
+            self._ina.bus = smbus2.SMBus(INA219_BUS)
+            logging.info("I2C bus recovery succeeded")
+        except Exception as e:
+            logging.error(f"I2C bus recovery (reconnect) failed: {e}")
 
     def stop(self):
         if self._timer:
@@ -173,6 +172,7 @@ class BatteryMonitor(QObject):
         self._current = 0.0
         self._power = 0.0
         self._buf = deque(maxlen=5)
+        self._current_history = deque(maxlen=30)
         self._low30_notified = False
         self._low20_notified = False
         self._low10_notified = False
@@ -228,23 +228,24 @@ class BatteryMonitor(QObject):
         return menu
 
     def _on_reading(self, v, c, w):
-        if not (2.5 <= v <= 4.35):  # discard transient garbage after I2C bus reset
+        if not (MIN_VOLTAGE_V - 0.5 <= v <= MAX_VOLTAGE_V + 0.5):
             logging.warning(f"Ignoring out-of-range voltage: {v:.2f}V")
             return
         if self._i2c_error_notified:
             self._buf.clear()
         self._buf.append((v, c, w))
-        v = statistics.median(r[0] for r in self._buf)
-        c = statistics.median(r[1] for r in self._buf)
-        w = statistics.median(r[2] for r in self._buf)
-        self._voltage = v
-        self._current = c
-        self._power = w
+        mv = statistics.median(r[0] for r in self._buf)
+        mc = statistics.median(r[1] for r in self._buf)
+        mw = statistics.median(r[2] for r in self._buf)
+        self._voltage = mv
+        self._current = mc
+        self._power = mw
         self._i2c_error_notified = False
-        self._charging = c < -CHARGE_THRESHOLD_MA
+        self._charging = mc < -CHARGE_THRESHOLD_MA
 
         if self._prev_charging is not None and self._prev_charging != self._charging:
             if self._charging:
+                self._current_history.clear()
                 self._tray.showMessage("Power Connected", "Battery is charging.",
                                        QSystemTrayIcon.Information, 4000)
                 if self._shutdown_timer.isActive():
@@ -254,12 +255,15 @@ class BatteryMonitor(QObject):
                                        QSystemTrayIcon.Warning, 4000)
         self._prev_charging = self._charging
 
-        self._percent = voltage_to_percent(v)
+        if not self._charging:
+            self._current_history.append(abs(mc))
+
+        self._percent = voltage_to_percent(mv)
         icon_idx = int(self._percent / 10) + (11 if self._charging else 0)
         self._tray.setIcon(QIcon(_img(f"battery.{icon_idx}.png")))
 
         time_str = self._time_str()
-        tooltip = "%d%%  %.2fV  %dmA  %.1fW  %s" % (self._percent, v, abs(c), w, time_str)
+        tooltip = f"{self._percent}%  {mv:.2f}V  {abs(int(mc))}mA  {mw:.1f}W  {time_str}"
         self._tray.setToolTip(tooltip.strip())
         logging.info(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {tooltip.strip()}")
 
@@ -281,57 +285,65 @@ class BatteryMonitor(QObject):
     def _time_str(self):
         if self._charging:
             return "charging"
-        mA = abs(self._current)
-        if mA > 10:
+        if not self._current_history:
+            return ""
+        avg_mA = statistics.mean(self._current_history)
+        if avg_mA > 10:
             remaining = (self._percent / 100.0) * BATTERY_CAPACITY_MAH
-            return format_time(int(remaining / mA * 60))
+            return format_time(int(remaining / avg_mA * 60))
         return ""
 
     def _status_text(self):
         return (
-            "Percent:    %d%%\n"
-            "Voltage:    %.2fV\n"
-            "Current:    %4dmA\n"
-            "Power:      %.1fW\n"
-            "Remaining:  %s"
-        ) % (self._percent, self._voltage, abs(self._current), self._power, self._time_str())
+            f"Percent:    {self._percent}%\n"
+            f"Voltage:    {self._voltage:.2f}V\n"
+            f"Current:    {int(abs(self._current)):4d}mA\n"
+            f"Power:      {self._power:.1f}W\n"
+            f"Remaining:  {self._time_str()}"
+        )
 
     def _check_warnings(self):
         p = self._percent
-        if WARN_20_PCT < p <= WARN_30_PCT and not self._low30_notified:
-            self._low30_notified = True
-            self._tray.showMessage("Battery Low",
-                                   "Battery at 30%. Consider connecting the power adapter.",
-                                   QSystemTrayIcon.Warning, 5000)
-        if WARN_10_PCT < p <= WARN_20_PCT and not self._low20_notified:
+        if p <= WARN_5_PCT and not self._low5_notified:
+            self._low5_notified = True
+            self._low10_notified = True
             self._low20_notified = True
+            self._low30_notified = True
+            self._countdown = SHUTDOWN_COUNTDOWN_SEC
+            self._shutdown_timer.start()
+            dlg = QMessageBox(QMessageBox.NoIcon, "Battery Critical",
+                              "<p><strong>Battery at 5% — critical!<br>"
+                              "Connect the power adapter.</strong>")
+            dlg.setIconPixmap(QPixmap(_img("batteryQ.png")))
+            dlg.setInformativeText(f"Auto-shutdown in {self._countdown} seconds")
+            dlg.addButton("Cancel", QMessageBox.RejectRole).clicked.connect(
+                lambda: self._cancel_shutdown(user_dismissed=True)
+            )
+            self._critical_dlg = dlg
+            dlg.show()
+        elif p <= WARN_10_PCT and not self._low10_notified:
+            self._low10_notified = True
+            self._low20_notified = True
+            self._low30_notified = True
+            self._tray.showMessage("Battery Critical",
+                                   "Battery at 10%. Connect power adapter immediately!",
+                                   QSystemTrayIcon.Critical, 8000)
+        elif p <= WARN_20_PCT and not self._low20_notified:
+            self._low20_notified = True
+            self._low30_notified = True
             dlg = QMessageBox(QMessageBox.Warning, "Battery Warning",
-                              "<p><strong>Заряд батареи 20%!<br>"
-                              "Подключите адаптер питания.</strong>")
+                              "<p><strong>Battery at 20%!<br>"
+                              "Connect the power adapter.</strong>")
             dlg.setIconPixmap(QPixmap(_img("batteryQ.png")))
             dlg.addButton("OK", QMessageBox.AcceptRole)
             dlg.finished.connect(lambda: setattr(self, "_warn20_dlg", None))
             self._warn20_dlg = dlg
             dlg.show()
-        if WARN_5_PCT < p <= WARN_10_PCT and not self._low10_notified:
-            self._low10_notified = True
-            self._tray.showMessage("Battery Critical",
-                                   "Battery at 10%. Connect power adapter immediately!",
-                                   QSystemTrayIcon.Critical, 8000)
-        if p <= WARN_5_PCT and not self._low5_notified:
-            self._low5_notified = True
-            self._countdown = SHUTDOWN_COUNTDOWN_SEC
-            self._shutdown_timer.start()
-            dlg = QMessageBox(QMessageBox.NoIcon, "Battery Critical",
-                              "<p><strong>Заряд батареи 5% — критический уровень!<br>"
-                              "Подключите адаптер питания.</strong>")
-            dlg.setIconPixmap(QPixmap(_img("batteryQ.png")))
-            dlg.setInformativeText(f"автовыключение через {self._countdown} секунд")
-            dlg.addButton("Отмена", QMessageBox.RejectRole).clicked.connect(
-                lambda: self._cancel_shutdown(user_dismissed=True)
-            )
-            self._critical_dlg = dlg
-            dlg.show()
+        elif p <= WARN_30_PCT and not self._low30_notified:
+            self._low30_notified = True
+            self._tray.showMessage("Battery Low",
+                                   "Battery at 30%. Consider connecting the power adapter.",
+                                   QSystemTrayIcon.Warning, 5000)
 
     def _tick(self):
         self._countdown -= 1
@@ -340,7 +352,7 @@ class BatteryMonitor(QObject):
             self._do_shutdown()
         elif self._critical_dlg:
             self._critical_dlg.setInformativeText(
-                f"автовыключение через {self._countdown} секунд"
+                f"Auto-shutdown in {self._countdown} seconds"
             )
 
     def _cancel_shutdown(self, user_dismissed=True):
@@ -349,7 +361,6 @@ class BatteryMonitor(QObject):
             self._critical_dlg.close()
             self._critical_dlg = None
         if not user_dismissed:
-            # charging resumed — allow warning again on next discharge
             self._low10_notified = False
 
     def _do_shutdown(self):
@@ -399,8 +410,6 @@ class BatteryMonitor(QObject):
                                    QSystemTrayIcon.Critical, 4000)
 
     def _stop_worker(self):
-        if not hasattr(self, "_worker"):
-            return
         self._worker.stop()
         self._thread.quit()
         self._thread.wait()
