@@ -88,6 +88,7 @@ class Worker(QObject):
     error   = pyqtSignal(str)
 
     _RECOVERY_AFTER = 3  # consecutive errors before bus reset attempt
+    _INIT_RETRY_MS  = 10_000
 
     def __init__(self, ina):
         super().__init__()
@@ -98,11 +99,24 @@ class Worker(QObject):
 
     def run(self):
         self._timer = QTimer()
-        self._timer.setInterval(POLL_INTERVAL_MS)
         self._timer.timeout.connect(self._poll)
+        if self._ina is None:
+            logging.info("INA219 not ready at startup — will retry every 10 s")
+            self._timer.setInterval(self._INIT_RETRY_MS)
+        else:
+            self._timer.setInterval(POLL_INTERVAL_MS)
         self._timer.start()
 
     def _poll(self):
+        if self._ina is None:
+            try:
+                self._ina = INA219.INA219(i2c_bus=INA219_BUS, addr=INA219_ADDR)
+                logging.info("INA219 initialised successfully")
+                self._timer.setInterval(POLL_INTERVAL_MS)
+            except Exception as e:
+                logging.warning(f"INA219 init retry failed: {e}")
+            return
+
         try:
             v = self._ina.getBusVoltage_V()
             c = int(self._ina.getCurrent_mA())
@@ -180,21 +194,14 @@ class BatteryMonitor(QObject):
         self._shutdown_timer.timeout.connect(self._tick)
 
         ina = None
-        for attempt in range(10):
-            try:
-                ina = INA219.INA219(i2c_bus=INA219_BUS, addr=INA219_ADDR)
-                break
-            except Exception as e:
-                logging.warning(f"INA219 init attempt {attempt + 1}/10 failed: {e}")
-                time.sleep(2)
-
-        if ina is None:
-            logging.error("Failed to initialise INA219 after 10 attempts")
+        try:
+            ina = INA219.INA219(i2c_bus=INA219_BUS, addr=INA219_ADDR)
+        except Exception as e:
+            logging.warning(f"INA219 init failed at startup, will retry in background: {e}")
             self._tray.showMessage("Sensor Error",
-                                   "Cannot initialise battery sensor",
-                                   QSystemTrayIcon.Critical, 8000)
-            self._tray.setToolTip("Sensor init failed")
-            return
+                                   "Cannot initialise battery sensor. Retrying...",
+                                   QSystemTrayIcon.Warning, 8000)
+            self._tray.setToolTip("Sensor init failed — retrying...")
 
         self._thread = QThread()
         self._worker = Worker(ina)
@@ -392,6 +399,8 @@ class BatteryMonitor(QObject):
                                    QSystemTrayIcon.Critical, 4000)
 
     def _stop_worker(self):
+        if not hasattr(self, "_worker"):
+            return
         self._worker.stop()
         self._thread.quit()
         self._thread.wait()
