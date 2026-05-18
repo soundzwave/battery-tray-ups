@@ -35,6 +35,7 @@ def _get(section, key, fallback):
 BATTERY_CAPACITY_MAH   = int(_get("battery", "capacity_mah",               4000))
 MIN_VOLTAGE_V          = float(_get("battery", "min_voltage_v",             3.00))
 MAX_VOLTAGE_V          = float(_get("battery", "max_voltage_v",             4.20))
+WARN_FULL_PCT          = int(_get("battery", "warn_full_pct",                  98))
 WARN_30_PCT            = int(_get("battery", "warn_30_pct",                   30))
 WARN_20_PCT            = int(_get("battery", "warn_20_pct",                   20))
 WARN_10_PCT            = int(_get("battery", "warn_10_pct",                   10))
@@ -225,10 +226,11 @@ class BatteryMonitor(QObject):
         self._buf = deque(maxlen=5)
         self._current_history = deque(maxlen=_CURRENT_HISTORY_LEN)
         self._charge_history  = deque(maxlen=_CURRENT_HISTORY_LEN)
+        self._full_notified  = False
         self._low30_notified = False
         self._low20_notified = False
         self._low10_notified = False
-        self._low5_notified = False
+        self._low5_notified  = False
         self._i2c_error_notified = False
         self._countdown = 0
         self._status_dlg = None
@@ -354,6 +356,8 @@ class BatteryMonitor(QObject):
 
         self._write_status_file()
 
+        if not self._charging:
+            self._full_notified = False
         if self._charging or self._percent > WARN_30_PCT:
             self._low30_notified = False
         if self._charging or self._percent > WARN_20_PCT:
@@ -362,6 +366,11 @@ class BatteryMonitor(QObject):
             self._low10_notified = False
         if self._charging or self._percent > WARN_5_PCT:
             self._low5_notified = False
+
+        if self._charging and self._percent >= WARN_FULL_PCT and not self._full_notified:
+            self._full_notified = True
+            self._notify("Battery Full", "Battery is fully charged. You can unplug.",
+                         QSystemTrayIcon.Information, 6000)
 
         if not self._charging:
             self._check_warnings()
@@ -571,10 +580,11 @@ class BatteryMonitor(QObject):
         subprocess.run(["systemctl", "suspend"])
 
     def _reload_config(self, path: str):
-        global WARN_30_PCT, WARN_20_PCT, WARN_10_PCT, WARN_5_PCT
+        global WARN_FULL_PCT, WARN_30_PCT, WARN_20_PCT, WARN_10_PCT, WARN_5_PCT
         global SHUTDOWN_COUNTDOWN_SEC, CHARGE_THRESHOLD_MA, POLL_INTERVAL_MS
         global NOTIFY_BACKEND, BATTERY_GOVERNOR, AC_GOVERNOR, WIFI_IFACE, WIFI_POWERSAVE, STATUS_FILE
         _cfg.read(self._config_path)
+        WARN_FULL_PCT          = int(_get("battery", "warn_full_pct",                  98))
         WARN_30_PCT            = int(_get("battery", "warn_30_pct",                  30))
         WARN_20_PCT            = int(_get("battery", "warn_20_pct",                  20))
         WARN_10_PCT            = int(_get("battery", "warn_10_pct",                  10))
