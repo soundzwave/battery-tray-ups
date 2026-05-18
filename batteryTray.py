@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import json
 import socket
 import logging
 import logging.handlers
@@ -18,7 +19,7 @@ from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
 )
-from PyQt5.QtCore import QObject, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot, QTimer, QFileSystemWatcher
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
@@ -41,6 +42,7 @@ WARN_5_PCT             = int(_get("battery", "warn_5_pct",                     5
 SHUTDOWN_COUNTDOWN_SEC = int(_get("battery", "shutdown_countdown_sec",        60))
 INA219_ADDR            = int(_get("sensor",  "ina219_addr",               "0x43"), 0)
 INA219_BUS             = int(_get("sensor",  "i2c_bus",                        1))
+UPS_CONTROLLER_ADDR    = int(_get("sensor",  "ups_controller_addr",        "0x2d"), 0)
 CHARGE_THRESHOLD_MA    = int(_get("sensor",  "charge_current_threshold_ma",   50))
 POLL_INTERVAL_MS       = int(_get("sensor",  "poll_interval_ms",            1000))
 _CURRENT_HISTORY_LEN   = max(5, 300_000 // POLL_INTERVAL_MS)  # ~5 min window
@@ -48,6 +50,12 @@ LOG_FILE               = _get("logging", "log_file",                           "
 LOG_MAX_BYTES          = int(_get("logging", "max_bytes",                 1048576))
 LOG_BACKUP_COUNT       = int(_get("logging", "backup_count",                    3))
 DISCHARGE_CURVE        = _get("battery", "discharge_curve",               "lipo")
+NOTIFY_BACKEND         = _get("notifications", "backend",                    "qt")
+BATTERY_GOVERNOR       = _get("power",   "battery_governor",           "powersave")
+AC_GOVERNOR            = _get("power",   "ac_governor",                 "ondemand")
+WIFI_IFACE             = _get("power",   "wifi_interface",                "wlan0")
+WIFI_POWERSAVE         = _get("power",   "wifi_powersave_on_battery",     "true").lower() == "true"
+STATUS_FILE            = _get("output",  "status_file", "/tmp/battery_status.json")
 
 _handlers = [logging.StreamHandler()]
 if LOG_FILE:
@@ -189,6 +197,11 @@ class Worker(QObject):
         except Exception as e:
             logging.error(f"I2C bus recovery (reconnect) failed: {e}")
 
+    @pyqtSlot(int)
+    def set_interval(self, ms: int):
+        if self._timer:
+            self._timer.setInterval(ms)
+
     def stop(self):
         if self._timer:
             self._timer.stop()
@@ -199,6 +212,8 @@ class Worker(QObject):
 
 
 class BatteryMonitor(QObject):
+    _poll_interval_changed = pyqtSignal(int)
+
     def __init__(self):
         super().__init__()
         self._charging = False
@@ -224,6 +239,9 @@ class BatteryMonitor(QObject):
         self._tray = QSystemTrayIcon()
         self._tray.setIcon(QIcon(_img("battery.png")))
         self._tray.setContextMenu(self._build_menu())
+        self._tray.activated.connect(
+            lambda r: self._show_status() if r == QSystemTrayIcon.Trigger else None
+        )
         self._tray.show()
 
         self._shutdown_timer = QTimer()
@@ -235,10 +253,19 @@ class BatteryMonitor(QObject):
             ina = INA219.INA219(i2c_bus=INA219_BUS, addr=INA219_ADDR)
         except Exception as e:
             logging.warning(f"INA219 init failed at startup, will retry in background: {e}")
-            self._tray.showMessage("Sensor Error",
-                                   "Cannot initialise battery sensor. Retrying...",
-                                   QSystemTrayIcon.Warning, 8000)
+            self._notify("Sensor Error",
+                         "Cannot initialise battery sensor. Retrying...",
+                         QSystemTrayIcon.Warning, 8000)
             self._tray.setToolTip("Sensor init failed — retrying...")
+
+        if ina is not None:
+            try:
+                self._charging = ina.getCurrent_mA() < -CHARGE_THRESHOLD_MA
+            except Exception:
+                pass
+        self._prev_charging = self._charging
+        self._set_cpu_governor(AC_GOVERNOR if self._charging else BATTERY_GOVERNOR)
+        self._set_wifi_powersave(not self._charging)
 
         self._thread = QThread()
         self._worker = Worker(ina)
@@ -247,8 +274,13 @@ class BatteryMonitor(QObject):
         self._thread.started.connect(self._worker.run)
         self._worker.reading.connect(self._on_reading)
         self._worker.error.connect(self._on_i2c_error)
+        self._poll_interval_changed.connect(self._worker.set_interval)
         QApplication.instance().aboutToQuit.connect(self._stop_worker)
         self._thread.start()
+
+        self._config_path = os.path.join(BASE_DIR, "config.ini")
+        self._config_watcher = QFileSystemWatcher([self._config_path])
+        self._config_watcher.fileChanged.connect(self._reload_config)
 
         self._watchdog_timer = QTimer()
         self._watchdog_timer.setInterval(15_000)
@@ -289,14 +321,18 @@ class BatteryMonitor(QObject):
         if self._prev_charging is not None and self._prev_charging != self._charging:
             if self._charging:
                 self._current_history.clear()
-                self._tray.showMessage("Power Connected", "Battery is charging.",
-                                       QSystemTrayIcon.Information, 4000)
+                self._notify("Power Connected", "Battery is charging.",
+                             QSystemTrayIcon.Information, 4000)
                 if self._shutdown_timer.isActive():
                     self._cancel_shutdown(user_dismissed=False)
+                self._set_cpu_governor(AC_GOVERNOR)
+                self._set_wifi_powersave(False)
             else:
                 self._charge_history.clear()
-                self._tray.showMessage("Power Disconnected", "Running on battery.",
-                                       QSystemTrayIcon.Warning, 4000)
+                self._notify("Power Disconnected", "Running on battery.",
+                             QSystemTrayIcon.Warning, 4000)
+                self._set_cpu_governor(BATTERY_GOVERNOR)
+                self._set_wifi_powersave(True)
         self._prev_charging = self._charging
 
         if self._charging:
@@ -315,6 +351,8 @@ class BatteryMonitor(QObject):
 
         if self._status_dlg and self._status_dlg.isVisible():
             self._status_dlg.setInformativeText(self._status_text())
+
+        self._write_status_file()
 
         if self._charging or self._percent > WARN_30_PCT:
             self._low30_notified = False
@@ -371,6 +409,9 @@ class BatteryMonitor(QObject):
                               "Connect the power adapter.</strong>")
             dlg.setIconPixmap(QPixmap(_img("batteryQ.png")))
             dlg.setInformativeText(f"Auto-shutdown in {self._countdown} seconds")
+            dlg.addButton("Suspend", QMessageBox.ActionRole).clicked.connect(
+                self._do_suspend
+            )
             dlg.addButton("Cancel", QMessageBox.RejectRole).clicked.connect(
                 lambda: self._cancel_shutdown(user_dismissed=True)
             )
@@ -380,9 +421,9 @@ class BatteryMonitor(QObject):
             self._low10_notified = True
             self._low20_notified = True
             self._low30_notified = True
-            self._tray.showMessage("Battery Critical",
-                                   "Battery at 10%. Connect power adapter immediately!",
-                                   QSystemTrayIcon.Critical, 8000)
+            self._notify("Battery Critical",
+                         "Battery at 10%. Connect power adapter immediately!",
+                         QSystemTrayIcon.Critical, 8000)
         elif p <= WARN_20_PCT and not self._low20_notified:
             self._low20_notified = True
             self._low30_notified = True
@@ -396,9 +437,9 @@ class BatteryMonitor(QObject):
             dlg.show()
         elif p <= WARN_30_PCT and not self._low30_notified:
             self._low30_notified = True
-            self._tray.showMessage("Battery Low",
-                                   "Battery at 30%. Consider connecting the power adapter.",
-                                   QSystemTrayIcon.Warning, 5000)
+            self._notify("Battery Low",
+                         "Battery at 30%. Consider connecting the power adapter.",
+                         QSystemTrayIcon.Warning, 5000)
 
     def _tick(self):
         self._countdown -= 1
@@ -422,10 +463,13 @@ class BatteryMonitor(QObject):
         if self._critical_dlg:
             self._critical_dlg.close()
         try:
-            result = subprocess.run(["i2cdetect", "-y", "-r", str(INA219_BUS), "0x2d", "0x2d"],
-                                    capture_output=True, text=True, timeout=5)
-            if "2d" in result.stdout:
-                subprocess.run(["i2cset", "-y", str(INA219_BUS), "0x2d", "0x01", "0x55"], timeout=5)
+            addr_hex = hex(UPS_CONTROLLER_ADDR)
+            addr_str = format(UPS_CONTROLLER_ADDR, '02x')
+            result = subprocess.run(
+                ["i2cdetect", "-y", "-r", str(INA219_BUS), addr_hex, addr_hex],
+                capture_output=True, text=True, timeout=5)
+            if addr_str in result.stdout:
+                subprocess.run(["i2cset", "-y", str(INA219_BUS), addr_hex, "0x01", "0x55"], timeout=5)
         except Exception as e:
             logging.error(f"i2c shutdown sequence failed: {e}")
         subprocess.run(["sudo", "poweroff"])
@@ -449,7 +493,7 @@ class BatteryMonitor(QObject):
         dlg = QMessageBox(QMessageBox.NoIcon, "About",
                           "<p><strong>Battery Monitor</strong>"
                           "<p>Version: v1.2"
-                          "<p>UPS HAT battery tray for Raspberry Pi")
+                          "<p>UPS HAT battery tray for Orange Pi Zero 3")
         dlg.setInformativeText('<a href="https://www.waveshare.com">WaveShare Official Website</a>')
         dlg.setIconPixmap(QPixmap(_img("logo.png")))
         dlg.finished.connect(lambda: setattr(self, "_about_dlg", None))
@@ -461,8 +505,95 @@ class BatteryMonitor(QObject):
         self._tray.setToolTip("I2C error — sensor unavailable")
         if not self._i2c_error_notified:
             self._i2c_error_notified = True
-            self._tray.showMessage("Sensor Error", "Cannot read battery sensor. Retrying...",
-                                   QSystemTrayIcon.Critical, 4000)
+            self._notify("Sensor Error", "Cannot read battery sensor. Retrying...",
+                         QSystemTrayIcon.Critical, 4000)
+
+    def _notify(self, title: str, body: str, icon=QSystemTrayIcon.Information, timeout_ms: int = 5000):
+        if NOTIFY_BACKEND == "notify-send":
+            urgency = {
+                QSystemTrayIcon.Information: "low",
+                QSystemTrayIcon.Warning:     "normal",
+                QSystemTrayIcon.Critical:    "critical",
+            }.get(icon, "normal")
+            try:
+                subprocess.run(
+                    ["notify-send", "-u", urgency, "-t", str(timeout_ms), title, body],
+                    capture_output=True, timeout=3
+                )
+            except Exception as e:
+                logging.warning(f"notify-send failed: {e}")
+        else:
+            self._tray.showMessage(title, body, icon, timeout_ms)
+
+    def _set_cpu_governor(self, governor: str):
+        for cpu in range(4):
+            try:
+                with open(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor", "w") as f:
+                    f.write(governor)
+            except OSError as e:
+                logging.warning(f"CPU governor set failed for cpu{cpu}: {e}")
+
+    def _set_wifi_powersave(self, enable: bool):
+        if not WIFI_IFACE or not WIFI_POWERSAVE:
+            return
+        try:
+            subprocess.run(["iwconfig", WIFI_IFACE, "power", "on" if enable else "off"],
+                           capture_output=True, timeout=3)
+        except Exception as e:
+            logging.warning(f"WiFi power mode set failed: {e}")
+
+    def _write_status_file(self):
+        if not STATUS_FILE:
+            return
+        data = {
+            "percent":       self._percent,
+            "voltage":       round(self._voltage, 3),
+            "current_ma":    int(self._current),
+            "power_w":       round(self._power, 2),
+            "charging":      self._charging,
+            "time_remaining": self._time_str(),
+            "timestamp":     int(time.time()),
+        }
+        try:
+            tmp = STATUS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, STATUS_FILE)
+        except OSError as e:
+            logging.warning(f"Status file write failed: {e}")
+
+    def _do_suspend(self):
+        self._cancel_shutdown(user_dismissed=True)
+        try:
+            subprocess.run(["loginctl", "lock-session"], timeout=3)
+        except Exception as e:
+            logging.warning(f"Screen lock failed: {e}")
+        subprocess.run(["systemctl", "suspend"])
+
+    def _reload_config(self, path: str):
+        global WARN_30_PCT, WARN_20_PCT, WARN_10_PCT, WARN_5_PCT
+        global SHUTDOWN_COUNTDOWN_SEC, CHARGE_THRESHOLD_MA, POLL_INTERVAL_MS
+        global NOTIFY_BACKEND, BATTERY_GOVERNOR, AC_GOVERNOR, WIFI_IFACE, WIFI_POWERSAVE, STATUS_FILE
+        _cfg.read(self._config_path)
+        WARN_30_PCT            = int(_get("battery", "warn_30_pct",                  30))
+        WARN_20_PCT            = int(_get("battery", "warn_20_pct",                  20))
+        WARN_10_PCT            = int(_get("battery", "warn_10_pct",                  10))
+        WARN_5_PCT             = int(_get("battery", "warn_5_pct",                    5))
+        SHUTDOWN_COUNTDOWN_SEC = int(_get("battery", "shutdown_countdown_sec",        60))
+        CHARGE_THRESHOLD_MA    = int(_get("sensor",  "charge_current_threshold_ma",   50))
+        new_poll               = int(_get("sensor",  "poll_interval_ms",            1000))
+        NOTIFY_BACKEND         = _get("notifications", "backend",                    "qt")
+        BATTERY_GOVERNOR       = _get("power",   "battery_governor",           "powersave")
+        AC_GOVERNOR            = _get("power",   "ac_governor",                 "ondemand")
+        WIFI_IFACE             = _get("power",   "wifi_interface",                "wlan0")
+        WIFI_POWERSAVE         = _get("power",   "wifi_powersave_on_battery", "true").lower() == "true"
+        STATUS_FILE            = _get("output",  "status_file", "/tmp/battery_status.json")
+        if new_poll != POLL_INTERVAL_MS:
+            POLL_INTERVAL_MS = new_poll
+            self._poll_interval_changed.emit(new_poll)
+        logging.info("config.ini reloaded")
+        if path not in self._config_watcher.files():
+            self._config_watcher.addPath(path)
 
     def _stop_worker(self):
         self._worker.stop()
