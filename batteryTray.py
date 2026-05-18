@@ -15,11 +15,18 @@ import statistics
 import smbus2
 from collections import deque
 import INA219
-from PyQt5.QtGui import QIcon, QPixmap
-from PyQt5.QtWidgets import (
-    QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
+from PyQt5.QtGui import (
+    QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF, QPainterPath,
 )
-from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot, QTimer, QFileSystemWatcher
+from PyQt5.QtWidgets import (
+    QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QProgressBar, QFrame,
+)
+from PyQt5.QtCore import (
+    QObject, QThread, pyqtSignal, pyqtSlot, QTimer, QFileSystemWatcher,
+    Qt, QPointF, QSize,
+)
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
@@ -46,7 +53,7 @@ INA219_BUS             = int(_get("sensor",  "i2c_bus",                        1
 UPS_CONTROLLER_ADDR    = int(_get("sensor",  "ups_controller_addr",        "0x2d"), 0)
 CHARGE_THRESHOLD_MA    = int(_get("sensor",  "charge_current_threshold_ma",   50))
 POLL_INTERVAL_MS       = int(_get("sensor",  "poll_interval_ms",            1000))
-_CURRENT_HISTORY_LEN   = max(5, 300_000 // POLL_INTERVAL_MS)  # ~5 min window
+_CURRENT_HISTORY_LEN   = max(5, 300_000 // POLL_INTERVAL_MS)
 LOG_FILE               = _get("logging", "log_file",                           "")
 LOG_MAX_BYTES          = int(_get("logging", "max_bytes",                 1048576))
 LOG_BACKUP_COUNT       = int(_get("logging", "backup_count",                    3))
@@ -116,9 +123,163 @@ def format_time(minutes):
         return f"~{minutes // 60}h {minutes % 60:02d}m"
     return f"~{minutes}m"
 
+# Charging animation: fill level oscillates ±16 pp around actual percent
+_ANIM_FILL_OFFSETS = [0, 4, 8, 12, 15, 16, 15, 12, 8, 4]
+
+
+def _battery_color(percent: int, charging: bool) -> QColor:
+    if charging:
+        return QColor(74, 158, 255)
+    if percent <= 20:
+        return QColor(231, 76, 60)
+    if percent <= 50:
+        return QColor(243, 156, 18)
+    return QColor(46, 204, 113)
+
+
+# ── Current graph widget ────────────────────────────────────────────────────
+
+class CurrentGraph(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data = []
+        self.setMinimumSize(240, 70)
+        self.setMaximumHeight(80)
+
+    def update_data(self, data):
+        self._data = list(data)
+        self.update()
+
+    def paintEvent(self, event):
+        del event  # Qt override — parameter required by signature but unused
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        p.fillRect(self.rect(), QColor(30, 30, 46))
+
+        if len(self._data) < 2:
+            p.setPen(QColor(100, 100, 130))
+            p.drawText(self.rect(), Qt.AlignCenter, "No data yet")
+            p.end()
+            return
+
+        mx = max(self._data) or 1
+
+        p.setPen(QPen(QColor(60, 60, 80), 1))
+        for i in range(1, 4):
+            p.drawLine(0, int(h * i / 4), w, int(h * i / 4))
+
+        pts = [
+            QPointF(w * i / (len(self._data) - 1),
+                    h - 4 - (h - 8) * v / mx)
+            for i, v in enumerate(self._data)
+        ]
+
+        path = QPainterPath()
+        path.moveTo(pts[0].x(), h)
+        for pt in pts:
+            path.lineTo(pt)
+        path.lineTo(pts[-1].x(), h)
+        path.closeSubpath()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(74, 158, 255, 50))
+        p.drawPath(path)
+
+        p.setPen(QPen(QColor(74, 158, 255), 1.5))
+        for i in range(len(pts) - 1):
+            p.drawLine(pts[i], pts[i + 1])
+
+        p.end()
+
+
+# ── Status window ───────────────────────────────────────────────────────────
+
+class StatusWindow(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("Battery Status")
+        self.setFixedWidth(280)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 12)
+
+        top = QHBoxLayout()
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedSize(48, 48)
+        top.addWidget(self._icon_lbl)
+        top.addSpacing(10)
+
+        right = QVBoxLayout()
+        self._pct_lbl = QLabel("—")
+        font = self._pct_lbl.font()
+        font.setPointSize(22)
+        font.setBold(True)
+        self._pct_lbl.setFont(font)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(8)
+        right.addWidget(self._pct_lbl)
+        right.addWidget(self._progress)
+        top.addLayout(right)
+        root.addLayout(top)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        root.addWidget(sep)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(4)
+        self._val = {}
+        for row, key in enumerate(["Voltage", "Current", "Power", "Remaining"]):
+            lk = QLabel(f"{key}:")
+            lk.setStyleSheet("color: #888;")
+            lv = QLabel("—")
+            grid.addWidget(lk, row, 0)
+            grid.addWidget(lv, row, 1)
+            self._val[key] = lv
+        root.addLayout(grid)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setFrameShadow(QFrame.Sunken)
+        root.addWidget(sep2)
+
+        hdr = QLabel("Current  (mA)")
+        hdr.setStyleSheet("color: #888; font-size: 10px;")
+        root.addWidget(hdr)
+        self._graph = CurrentGraph()
+        root.addWidget(self._graph)
+
+    def refresh(self, percent, voltage, current_ma, power_w,
+                time_str, charging, icon, history):
+        self._pct_lbl.setText(f"{percent}%")
+        self._progress.setValue(percent)
+
+        col = _battery_color(percent, charging).name()
+        self._progress.setStyleSheet(
+            f"QProgressBar::chunk {{ background: {col}; border-radius: 3px; }}"
+        )
+
+        self._icon_lbl.setPixmap(icon.pixmap(QSize(48, 48)))
+        self._val["Voltage"].setText(f"{voltage:.2f} V")
+        self._val["Current"].setText(f"{abs(int(current_ma))} mA")
+        self._val["Power"].setText(f"{power_w:.1f} W")
+        self._val["Remaining"].setText(time_str or "—")
+        self._graph.update_data(history)
+
+
+# ── Worker ──────────────────────────────────────────────────────────────────
 
 class Worker(QObject):
-    reading = pyqtSignal(float, float, float)  # voltage, current_mA, power_W
+    reading = pyqtSignal(float, float, float)
     error   = pyqtSignal(str)
 
     _RECOVERY_AFTER = 3
@@ -212,6 +373,8 @@ class Worker(QObject):
             pass
 
 
+# ── BatteryMonitor ──────────────────────────────────────────────────────────
+
 class BatteryMonitor(QObject):
     _poll_interval_changed = pyqtSignal(int)
 
@@ -233,13 +396,14 @@ class BatteryMonitor(QObject):
         self._low5_notified  = False
         self._i2c_error_notified = False
         self._countdown = 0
-        self._status_dlg = None
-        self._warn20_dlg = None
+        self._status_dlg  = None
+        self._warn20_dlg  = None
         self._critical_dlg = None
-        self._about_dlg = None
+        self._about_dlg   = None
+        self._anim_phase  = 0
 
         self._tray = QSystemTrayIcon()
-        self._tray.setIcon(QIcon(_img("battery.png")))
+        self._tray.setIcon(self._render_icon())
         self._tray.setContextMenu(self._build_menu())
         self._tray.activated.connect(
             lambda r: self._show_status() if r == QSystemTrayIcon.Trigger else None
@@ -249,6 +413,10 @@ class BatteryMonitor(QObject):
         self._shutdown_timer = QTimer()
         self._shutdown_timer.setInterval(1000)
         self._shutdown_timer.timeout.connect(self._tick)
+
+        self._anim_timer = QTimer()
+        self._anim_timer.setInterval(400)
+        self._anim_timer.timeout.connect(self._anim_tick)
 
         ina = None
         try:
@@ -268,6 +436,8 @@ class BatteryMonitor(QObject):
         self._prev_charging = self._charging
         self._set_cpu_governor(AC_GOVERNOR if self._charging else BATTERY_GOVERNOR)
         self._set_wifi_powersave(not self._charging)
+        if self._charging:
+            self._anim_timer.start()
 
         self._thread = QThread()
         self._worker = Worker(ina)
@@ -290,7 +460,11 @@ class BatteryMonitor(QObject):
         self._watchdog_timer.start()
         _sd_notify("READY=1")
 
+    # ── menu ────────────────────────────────────────────────────────────────
+
     def _build_menu(self):
+        self._status_action = QAction("—", self)
+        self._status_action.setEnabled(False)
         status_act = QAction("Status", self)
         about_act  = QAction("About",  self)
         quit_act   = QAction("Exit",   self)
@@ -298,11 +472,64 @@ class BatteryMonitor(QObject):
         about_act.triggered.connect(self._show_about)
         quit_act.triggered.connect(QApplication.instance().quit)
         menu = QMenu()
+        menu.addAction(self._status_action)
+        menu.addSeparator()
         menu.addAction(status_act)
         menu.addAction(about_act)
         menu.addSeparator()
         menu.addAction(quit_act)
         return menu
+
+    # ── icon rendering ──────────────────────────────────────────────────────
+
+    def _render_icon(self) -> QIcon:
+        SIZE = 64
+        pix = QPixmap(SIZE, SIZE)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        bx, by, bw, bh = 2, 18, 50, 28
+        nx, ny, nw, nh = 52, 27,  9, 10
+
+        border = QColor(180, 180, 180)
+        fill   = _battery_color(self._percent, self._charging)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(border)
+        p.drawRoundedRect(nx, ny, nw, nh, 2, 2)
+
+        p.setPen(QPen(border, 2.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(bx, by, bw, bh, 3, 3)
+
+        pct = self._percent
+        if self._charging:
+            pct = min(100, pct + _ANIM_FILL_OFFSETS[self._anim_phase])
+        fill_w = max(0, int((bw - 4) * pct / 100))
+        if fill_w > 0:
+            p.setPen(Qt.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(bx + 2, by + 2, fill_w, bh - 4, 2, 2)
+
+        if self._charging:
+            bolt = QPolygonF([
+                QPointF(30, 18), QPointF(22, 35), QPointF(29, 35),
+                QPointF(24, 50), QPointF(38, 30), QPointF(31, 30),
+                QPointF(36, 18),
+            ])
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 210))
+            p.drawPolygon(bolt)
+
+        p.end()
+        return QIcon(pix)
+
+    def _anim_tick(self):
+        self._anim_phase = (self._anim_phase + 1) % len(_ANIM_FILL_OFFSETS)
+        self._tray.setIcon(self._render_icon())
+
+    # ── sensor readings ─────────────────────────────────────────────────────
 
     def _on_reading(self, v, c, w):
         if not (MIN_VOLTAGE_V - 0.5 <= v <= MAX_VOLTAGE_V + 0.5):
@@ -316,7 +543,7 @@ class BatteryMonitor(QObject):
         mw = statistics.median(r[2] for r in self._buf)
         self._voltage = mv
         self._current = mc
-        self._power = mw
+        self._power   = mw
         self._i2c_error_notified = False
         self._charging = mc < -CHARGE_THRESHOLD_MA
 
@@ -329,12 +556,15 @@ class BatteryMonitor(QObject):
                     self._cancel_shutdown(user_dismissed=False)
                 self._set_cpu_governor(AC_GOVERNOR)
                 self._set_wifi_powersave(False)
+                self._anim_timer.start()
             else:
                 self._charge_history.clear()
                 self._notify("Power Disconnected", "Running on battery.",
                              QSystemTrayIcon.Warning, 4000)
                 self._set_cpu_governor(BATTERY_GOVERNOR)
                 self._set_wifi_powersave(True)
+                self._anim_timer.stop()
+                self._anim_phase = 0
         self._prev_charging = self._charging
 
         if self._charging:
@@ -343,16 +573,18 @@ class BatteryMonitor(QObject):
             self._current_history.append(abs(mc))
 
         self._percent = voltage_to_percent(mv)
-        icon_idx = int(self._percent / 10) + (11 if self._charging else 0)
-        self._tray.setIcon(QIcon(_img(f"battery.{icon_idx}.png")))
+        self._tray.setIcon(self._render_icon())
 
         time_str = self._time_str()
         tooltip = f"{self._percent}%  {mv:.2f}V  {abs(int(mc))}mA  {mw:.1f}W  {time_str}"
         self._tray.setToolTip(tooltip.strip())
         logging.info(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {tooltip.strip()}")
 
+        txt = f"{self._percent}%  {time_str}".strip() if time_str else f"{self._percent}%"
+        self._status_action.setText(txt)
+
         if self._status_dlg and self._status_dlg.isVisible():
-            self._status_dlg.setInformativeText(self._status_text())
+            self._refresh_status_dlg()
 
         self._write_status_file()
 
@@ -392,19 +624,39 @@ class BatteryMonitor(QObject):
             return format_time(int(remaining / avg_mA * 60))
         return ""
 
-    def _status_text(self):
-        return (
-            f"Percent:    {self._percent}%\n"
-            f"Voltage:    {self._voltage:.2f}V\n"
-            f"Current:    {int(abs(self._current)):4d}mA\n"
-            f"Power:      {self._power:.1f}W\n"
-            f"Remaining:  {self._time_str()}"
+    # ── status window ───────────────────────────────────────────────────────
+
+    def _refresh_status_dlg(self):
+        if self._status_dlg is None:
+            return
+        history = list(self._charge_history if self._charging else self._current_history)
+        self._status_dlg.refresh(
+            percent=self._percent,
+            voltage=self._voltage,
+            current_ma=self._current,
+            power_w=self._power,
+            time_str=self._time_str(),
+            charging=self._charging,
+            icon=self._render_icon(),
+            history=history,
         )
+
+    def _show_status(self):
+        if self._status_dlg is None:
+            self._status_dlg = StatusWindow()
+        self._refresh_status_dlg()
+        if self._status_dlg.isVisible():
+            self._status_dlg.raise_()
+            self._status_dlg.activateWindow()
+        else:
+            self._status_dlg.show()
+
+    # ── warnings & shutdown ─────────────────────────────────────────────────
 
     def _check_warnings(self):
         p = self._percent
         if p <= WARN_5_PCT and not self._low5_notified:
-            self._low5_notified = True
+            self._low5_notified  = True
             self._low10_notified = True
             self._low20_notified = True
             self._low30_notified = True
@@ -483,17 +735,15 @@ class BatteryMonitor(QObject):
             logging.error(f"i2c shutdown sequence failed: {e}")
         subprocess.run(["sudo", "poweroff"])
 
-    def _show_status(self):
-        if self._status_dlg and self._status_dlg.isVisible():
-            self._status_dlg.raise_()
-            self._status_dlg.activateWindow()
-            return
-        dlg = QMessageBox(QMessageBox.NoIcon, "Battery Status", "Battery Monitor")
-        dlg.setIconPixmap(QPixmap(_img(f"battery.{int(self._percent / 10)}.png")))
-        dlg.setInformativeText(self._status_text())
-        dlg.finished.connect(lambda: setattr(self, "_status_dlg", None))
-        self._status_dlg = dlg
-        dlg.show()
+    def _do_suspend(self):
+        self._cancel_shutdown(user_dismissed=True)
+        try:
+            subprocess.run(["loginctl", "lock-session"], timeout=3)
+        except Exception as e:
+            logging.warning(f"Screen lock failed: {e}")
+        subprocess.run(["systemctl", "suspend"])
+
+    # ── about ────────────────────────────────────────────────────────────────
 
     def _show_about(self):
         if self._about_dlg and self._about_dlg.isVisible():
@@ -501,13 +751,15 @@ class BatteryMonitor(QObject):
             return
         dlg = QMessageBox(QMessageBox.NoIcon, "About",
                           "<p><strong>Battery Monitor</strong>"
-                          "<p>Version: v1.2"
+                          "<p>Version: v1.3"
                           "<p>UPS HAT battery tray for Orange Pi Zero 3")
         dlg.setInformativeText('<a href="https://www.waveshare.com">WaveShare Official Website</a>')
         dlg.setIconPixmap(QPixmap(_img("logo.png")))
         dlg.finished.connect(lambda: setattr(self, "_about_dlg", None))
         self._about_dlg = dlg
         dlg.show()
+
+    # ── errors ───────────────────────────────────────────────────────────────
 
     def _on_i2c_error(self, msg):
         logging.error(f"I2C error: {msg}. Retrying in 5s...")
@@ -516,6 +768,8 @@ class BatteryMonitor(QObject):
             self._i2c_error_notified = True
             self._notify("Sensor Error", "Cannot read battery sensor. Retrying...",
                          QSystemTrayIcon.Critical, 4000)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
 
     def _notify(self, title: str, body: str, icon=QSystemTrayIcon.Information, timeout_ms: int = 5000):
         if NOTIFY_BACKEND == "notify-send":
@@ -555,13 +809,13 @@ class BatteryMonitor(QObject):
         if not STATUS_FILE:
             return
         data = {
-            "percent":       self._percent,
-            "voltage":       round(self._voltage, 3),
-            "current_ma":    int(self._current),
-            "power_w":       round(self._power, 2),
-            "charging":      self._charging,
+            "percent":        self._percent,
+            "voltage":        round(self._voltage, 3),
+            "current_ma":     int(self._current),
+            "power_w":        round(self._power, 2),
+            "charging":       self._charging,
             "time_remaining": self._time_str(),
-            "timestamp":     int(time.time()),
+            "timestamp":      int(time.time()),
         }
         try:
             tmp = STATUS_FILE + ".tmp"
@@ -570,14 +824,6 @@ class BatteryMonitor(QObject):
             os.replace(tmp, STATUS_FILE)
         except OSError as e:
             logging.warning(f"Status file write failed: {e}")
-
-    def _do_suspend(self):
-        self._cancel_shutdown(user_dismissed=True)
-        try:
-            subprocess.run(["loginctl", "lock-session"], timeout=3)
-        except Exception as e:
-            logging.warning(f"Screen lock failed: {e}")
-        subprocess.run(["systemctl", "suspend"])
 
     def _reload_config(self, path: str):
         global WARN_FULL_PCT, WARN_30_PCT, WARN_20_PCT, WARN_10_PCT, WARN_5_PCT
